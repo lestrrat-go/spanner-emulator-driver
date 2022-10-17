@@ -40,14 +40,18 @@ func Run(ctx context.Context, options ...Option) error {
 	childCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	cmd := exec.CommandContext(childCtx, "docker", "run", "--rm", "-p", grpcPortPublishSpec, "-p", restPortPublishSpec, DockerImage)
+	name := fmt.Sprintf("spanner-emulator-%d-%d", grpcSrcPort, restSrcPort)
+	cmd := exec.CommandContext(childCtx, "docker", "run", "-i", "--rm", "-p", grpcPortPublishSpec, "-p", restPortPublishSpec, "--name", name, DockerImage)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	exited := make(chan error, 1)
 	go func() {
 		defer close(exited)
-		exited <- cmd.Run()
+		err := cmd.Run()
+		_ = exec.Command("docker", "stop", name).Run()
+		log.Printf("ran docker stop")
+		exited <- err
 	}()
 
 	time.Sleep(time.Second)
@@ -82,5 +86,6 @@ OUTER:
 	}
 
 	<-ctx.Done()
+	<-exited
 	return nil
 }

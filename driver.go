@@ -6,6 +6,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	"cloud.google.com/go/spanner"
@@ -47,7 +49,7 @@ func New(dsn string) (*Driver, error) {
 
 // Run controls the emulator running in docker. The environment variable
 // SPANNER_EMULATOR_HOST will also be set to the appropriate value
-func (d *Driver) Run(ctx context.Context) {
+func (d *Driver) Run(ctx context.Context) <-chan error {
 	defer d.cond.Broadcast()
 
 	// channel to notify readiness to the user
@@ -75,11 +77,11 @@ func (d *Driver) Run(ctx context.Context) {
 	select {
 	case <-ctx.Done():
 		d.notifyReady(fmt.Errorf(`context canceled exited before emulator became ready`))
-		return
+		return exited
 	case err := <-exited:
 		// WHAT?!
 		d.notifyReady(fmt.Errorf(`emulator exited before becoming ready: %w`, err))
-		return
+		return exited
 	case <-emuReady:
 		// ready, go on
 	}
@@ -87,11 +89,11 @@ func (d *Driver) Run(ctx context.Context) {
 	// start preparing
 	if err := d.setup(ctx); err != nil {
 		d.notifyReady(fmt.Errorf(`failed to setup spanner emulator: %w`, err))
-		return
+		return exited
 	}
 
 	d.notifyReady(nil)
-	return
+	return exited
 }
 
 func (d *Driver) notifyReady(err error) {
@@ -176,10 +178,39 @@ func (d *Driver) createSpannerDatabase(ctx context.Context) error {
 		// no op, go to next
 	}
 
+	var extraStatements []string
+	// We can load the initial DDLs from the specified directory
+	if dir := os.Getenv(`SPANNER_EMULATOR_DDL_DIR`); dir != "" {
+		if _, err := os.Stat(dir); err != nil {
+			return fmt.Errorf(`ddl directory specified in SPANNER_EMULATOR_DDL_DIR does not exist`)
+		}
+
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return fmt.Errorf(`failed to read ddl directory %q: %w`, dir, err)
+		}
+
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			if !strings.HasSuffix(e.Name(), `.sql`) {
+				continue
+			}
+
+			fullpath := filepath.Join(dir, e.Name())
+			content, err := os.ReadFile(fullpath)
+			if err != nil {
+				return fmt.Errorf(`failed to read contents of %q: %w`, fullpath, err)
+			}
+			extraStatements = append(extraStatements, string(content))
+		}
+	}
+
 	op, err := adminClient.CreateDatabase(ctx, &databasepb.CreateDatabaseRequest{
 		Parent:          projectMarker + d.config.Project + instanceMarker + d.config.Instance,
 		CreateStatement: fmt.Sprintf("CREATE DATABASE `%s`", d.config.Database),
-		//		ExtraStatements: extraStatements,
+		ExtraStatements: extraStatements,
 	})
 	if err != nil {
 		return fmt.Errorf(`create database call failed: %w`, err)

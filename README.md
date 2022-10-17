@@ -28,10 +28,13 @@ func TestDriver(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go d.Run(ctx)
+	exited := d.Run(ctx)
 
 	require.NoError(t, d.Ready(ctx), `driver should start successfully`)
 
 	// Your tests go here
+
+	// Make sure to wait for the emulator to exit
+	<-exited
 }
 ```
