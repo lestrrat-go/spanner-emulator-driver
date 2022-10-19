@@ -21,6 +21,8 @@ var DefaultGRPCPort = 9010
 func Run(ctx context.Context, options ...Option) error {
 	grpcSrcPort := DefaultGRPCPort
 	restSrcPort := DefaultRESTPort
+	stopContainer := true
+	var onExit func() error
 	var notifyReady func()
 
 	//nolint:forcetypeassert
@@ -32,6 +34,10 @@ func Run(ctx context.Context, options ...Option) error {
 			restSrcPort = option.Value().(int)
 		case identNotifyReady{}:
 			notifyReady = option.Value().(func())
+		case identStopContainer{}:
+			stopContainer = option.Value().(bool)
+		case identOnExit{}:
+			onExit = option.Value().(func() error)
 		}
 	}
 	grpcPortPublishSpec := fmt.Sprintf(`%d:9010`, grpcSrcPort)
@@ -49,8 +55,18 @@ func Run(ctx context.Context, options ...Option) error {
 	go func() {
 		defer close(exited)
 		err := cmd.Run()
-		_ = exec.Command("docker", "stop", name).Run()
-		log.Printf("ran docker stop")
+
+		if onExit != nil {
+			if err := onExit(); err != nil {
+				log.Printf(`failed to execute onExit hook: %s`, err)
+			}
+		}
+
+		if stopContainer {
+			if err := exec.Command("docker", "stop", name).Run(); err != nil {
+				log.Printf("failed to stop docker container %q: %s", name, err)
+			}
+		}
 		exited <- err
 	}()
 

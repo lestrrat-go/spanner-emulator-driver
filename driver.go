@@ -19,6 +19,10 @@ import (
 	"google.golang.org/grpc/codes"
 )
 
+const (
+	SPANNER_EMULATOR_HOST = `SPANNER_EMULATOR_HOST`
+)
+
 // Driver is the main object to control the spanner emulator.
 // The zero value should not be used. Always use the value
 // returned from driver.New
@@ -48,8 +52,16 @@ func New(dsn string) (*Driver, error) {
 }
 
 // Run controls the emulator running in docker. The environment variable
-// SPANNER_EMULATOR_HOST will also be set to the appropriate value
-func (d *Driver) Run(ctx context.Context) <-chan error {
+// SPANNER_EMULATOR_HOST  will also be set to the appropriate value
+func (d *Driver) Run(ctx context.Context, options ...Option) <-chan error {
+	dropDatabase := true
+	for _, option := range options {
+		switch option.Ident() {
+		case identDropDatabase{}:
+			dropDatabase = option.Value().(bool)
+		}
+	}
+
 	defer d.cond.Broadcast()
 
 	// channel to notify readiness to the user
@@ -58,15 +70,40 @@ func (d *Driver) Run(ctx context.Context) <-chan error {
 	d.mu.Unlock()
 
 	// Setup environment variable
-	os.Setenv(`SPANNER_EMULATOR_HOST`, fmt.Sprintf(`localhost:%d`, emulator.DefaultGRPCPort))
+	os.Setenv(SPANNER_EMULATOR_HOST, fmt.Sprintf(`localhost:%d`, emulator.DefaultGRPCPort))
 
 	// channel to notify _US_ that the emulator is ready
 	emuReady := make(chan struct{})
 
+	emuOptions := []emulator.Option{
+		emulator.WithNotifyReady(func() { close(emuReady) }),
+	}
+
+	// TODO: currently we don't handle the case where we need to perform
+	// multiple operations in onExit... in that case we need to fix this
+	// code to accomodate multiple hooks
+	if dropDatabase {
+		emuOptions = append(emuOptions, emulator.WithOnExit(func() error {
+			adminClient, err := database.NewDatabaseAdminClient(ctx)
+			if err != nil {
+				return fmt.Errorf(`failed to create a database admin client: %w`, err)
+			}
+
+			fmt.Printf("Dropping database %q\n", d.dsn)
+			if err := adminClient.DropDatabase(ctx, &databasepb.DropDatabaseRequest{
+				Database: d.dsn,
+			}); err != nil {
+				return err
+			}
+
+			return nil
+		}))
+	}
 	exited := make(chan error, 1)
+
 	go func(ctx context.Context) {
 		defer close(exited)
-		if err := emulator.Run(ctx, emulator.WithNotifyReady(func() { close(emuReady) })); err != nil {
+		if err := emulator.Run(ctx, emuOptions...); err != nil {
 			select {
 			case <-ctx.Done():
 			case exited <- err:
