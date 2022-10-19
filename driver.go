@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"cloud.google.com/go/spanner"
 	database "cloud.google.com/go/spanner/admin/database/apiv1"
@@ -59,6 +60,8 @@ func (d *Driver) Run(ctx context.Context, options ...Option) <-chan error {
 		switch option.Ident() {
 		case identDropDatabase{}:
 			dropDatabase = option.Value().(bool)
+		case identDDLDirectory{}:
+			ctx = context.WithValue(ctx, identDDLDirectory{}, option.Value().(string))
 		}
 	}
 
@@ -84,9 +87,11 @@ func (d *Driver) Run(ctx context.Context, options ...Option) <-chan error {
 	// code to accomodate multiple hooks
 	if dropDatabase {
 		emuOptions = append(emuOptions, emulator.WithOnExit(func() error {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
 			adminClient, err := database.NewDatabaseAdminClient(ctx)
 			if err != nil {
-				return fmt.Errorf(`failed to create a database admin client: %w`, err)
+				return fmt.Errorf(`failed to create a database admin client to drop the database: %w`, err)
 			}
 
 			fmt.Printf("Dropping database %q\n", d.dsn)
@@ -217,7 +222,13 @@ func (d *Driver) createSpannerDatabase(ctx context.Context) error {
 
 	var extraStatements []string
 	// We can load the initial DDLs from the specified directory
-	if dir := os.Getenv(`SPANNER_EMULATOR_DDL_DIR`); dir != "" {
+	var ddlDirectory string
+	if v := ctx.Value(identDDLDirectory{}); v != nil {
+		if s, ok := v.(string); ok {
+			ddlDirectory = s
+		}
+	}
+	if dir := ddlDirectory; dir != "" {
 		if _, err := os.Stat(dir); err != nil {
 			return fmt.Errorf(`ddl directory specified in SPANNER_EMULATOR_DDL_DIR does not exist`)
 		}
