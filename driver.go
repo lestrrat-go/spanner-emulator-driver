@@ -142,8 +142,8 @@ func (d *Driver) notifyReady(err error) {
 	d.mu.Lock()
 	d.ready = true
 	d.setupError = err
-	d.mu.Unlock()
 	d.cond.Broadcast()
+	d.mu.Unlock()
 }
 
 func (d *Driver) Ready(ctx context.Context) error {
