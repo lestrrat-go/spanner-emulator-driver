@@ -21,6 +21,18 @@ func ParseDSN(dsn string) (*Config, error) {
 	// we won't check for i < 0 and what not.
 	databaseMarkerIdx := strings.Index(dsn, databaseMarker)
 	instanceMarkerIdx := strings.Index(dsn, instanceMarker)
+
+	if databaseMarkerIdx == -1 {
+		return nil, fmt.Errorf(`could not find marker %q in %q`, databaseMarker, dsn)
+	}
+	if instanceMarkerIdx == -1 {
+		return nil, fmt.Errorf(`could not find marker %q in %q`, instanceMarker, dsn)
+	}
+
+	if databaseMarkerIdx < instanceMarkerIdx {
+		return nil, fmt.Errorf(`invalid dsn: expected projects/PROJECT/instances/INSTANCE/databases/DATABASE, got %q`, dsn)
+	}
+
 	projectName := strings.TrimPrefix(dsn[:instanceMarkerIdx], projectMarker)
 	instanceName := dsn[instanceMarkerIdx+len(instanceMarker) : databaseMarkerIdx]
 	databaseName := dsn[databaseMarkerIdx+len(databaseMarker):]
