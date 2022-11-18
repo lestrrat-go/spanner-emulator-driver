@@ -5,6 +5,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,6 +35,7 @@ type Driver struct {
 	config     *Config
 	ready      bool
 	setupError error
+	onClose    []func() error
 }
 
 func New(dsn string) (*Driver, error) {
@@ -56,12 +58,15 @@ func New(dsn string) (*Driver, error) {
 // SPANNER_EMULATOR_HOST  will also be set to the appropriate value
 func (d *Driver) Run(ctx context.Context, options ...Option) <-chan error {
 	dropDatabase := true
+	useEmulator := true
 	for _, option := range options {
 		switch option.Ident() {
 		case identDropDatabase{}:
 			dropDatabase = option.Value().(bool)
 		case identDDLDirectory{}:
 			ctx = context.WithValue(ctx, identDDLDirectory{}, option.Value().(string))
+		case identUseEmulator{}:
+			useEmulator = option.Value().(bool)
 		}
 	}
 
@@ -72,70 +77,84 @@ func (d *Driver) Run(ctx context.Context, options ...Option) <-chan error {
 	d.ready = false
 	d.mu.Unlock()
 
-	// Setup environment variable
-	os.Setenv(SPANNER_EMULATOR_HOST, fmt.Sprintf(`localhost:%d`, emulator.DefaultGRPCPort))
+	dropDatabaseFn := func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		adminClient, err := database.NewDatabaseAdminClient(ctx)
+		if err != nil {
+			return fmt.Errorf(`failed to create a database admin client to drop the database: %w`, err)
+		}
 
-	// channel to notify _US_ that the emulator is ready
-	emuReady := make(chan struct{})
+		fmt.Printf("Dropping database %q\n", d.dsn)
+		if err := adminClient.DropDatabase(ctx, &databasepb.DropDatabaseRequest{
+			Database: d.dsn,
+		}); err != nil {
+			return err
+		}
 
-	emuOptions := []emulator.Option{
-		emulator.WithNotifyReady(func() { close(emuReady) }),
-	}
-
-	// TODO: currently we don't handle the case where we need to perform
-	// multiple operations in onExit... in that case we need to fix this
-	// code to accomodate multiple hooks
-	if dropDatabase {
-		emuOptions = append(emuOptions, emulator.WithOnExit(func() error {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			adminClient, err := database.NewDatabaseAdminClient(ctx)
-			if err != nil {
-				return fmt.Errorf(`failed to create a database admin client to drop the database: %w`, err)
-			}
-
-			fmt.Printf("Dropping database %q\n", d.dsn)
-			if err := adminClient.DropDatabase(ctx, &databasepb.DropDatabaseRequest{
-				Database: d.dsn,
-			}); err != nil {
-				return err
-			}
-
-			return nil
-		}))
+		return nil
 	}
 	exited := make(chan error, 1)
+	if !useEmulator {
+		close(exited) // won't use
+	} else {
+		// Setup environment variable
+		os.Setenv(SPANNER_EMULATOR_HOST, fmt.Sprintf(`localhost:%d`, emulator.DefaultGRPCPort))
 
-	go func(ctx context.Context) {
-		defer close(exited)
-		if err := emulator.Run(ctx, emuOptions...); err != nil {
-			select {
-			case <-ctx.Done():
-			case exited <- err:
-			}
+		// channel to notify _US_ that the emulator is ready
+		emuReady := make(chan struct{})
+
+		emuOptions := []emulator.Option{
+			emulator.WithNotifyReady(func() { close(emuReady) }),
 		}
-	}(ctx)
 
-	select {
-	case <-ctx.Done():
-		d.notifyReady(fmt.Errorf(`context canceled exited before emulator became ready`))
-		return exited
-	case err := <-exited:
-		// WHAT?!
-		d.notifyReady(fmt.Errorf(`emulator exited before becoming ready: %w`, err))
-		return exited
-	case <-emuReady:
-		// ready, go on
+		// TODO: currently we don't handle the case where we need to perform
+		// multiple operations in onExit... in that case we need to fix this
+		// code to accomodate multiple hooks
+		if dropDatabase {
+			emuOptions = append(emuOptions, emulator.WithOnExit(dropDatabaseFn))
+		}
+
+		go func(ctx context.Context) {
+			defer close(exited)
+			if err := emulator.Run(ctx, emuOptions...); err != nil {
+				select {
+				case <-ctx.Done():
+				case exited <- err:
+				}
+			}
+		}(ctx)
+
+		select {
+		case <-ctx.Done():
+			d.notifyReady(fmt.Errorf(`context canceled exited before emulator became ready`))
+			return exited
+		case err := <-exited:
+			// WHAT?!
+			d.notifyReady(fmt.Errorf(`emulator exited before becoming ready: %w`, err))
+			return exited
+		case <-emuReady:
+			// ready, go on
+		}
 	}
 
 	// start preparing
 	if err := d.setup(ctx); err != nil {
-		d.notifyReady(fmt.Errorf(`failed to setup spanner emulator: %w`, err))
+		d.notifyReady(fmt.Errorf(`failed to setup spanner: %w`, err))
 		return exited
+	}
+	if !useEmulator && dropDatabase {
+		d.onClose = append(d.onClose, dropDatabaseFn)
 	}
 
 	d.notifyReady(nil)
 	return exited
+}
+
+func (d *Driver) Close() {
+	for _, fn := range d.onClose {
+		fn()
+	}
 }
 
 func (d *Driver) notifyReady(err error) {
@@ -179,10 +198,13 @@ func (d *Driver) createSpannerInstance(ctx context.Context) error {
 	}
 	defer instanceAdminClient.Close()
 
+	name := projectMarker + d.config.Project + instanceMarker + d.config.Instance
+	log.Printf("Querying %q", name)
 	if _, err := instanceAdminClient.GetInstance(ctx, &instancepb.GetInstanceRequest{
-		Name: projectMarker + d.config.Project + instanceMarker + d.config.Instance,
+		Name: name,
 	}); err == nil {
 		// instance already exists
+		log.Printf("Instance %q already exists", name)
 		return nil
 	}
 
@@ -194,7 +216,7 @@ func (d *Driver) createSpannerInstance(ctx context.Context) error {
 		Parent:     projectMarker + d.config.Project,
 		InstanceId: d.config.Instance,
 	}); err != nil {
-		return fmt.Errorf(`failed to create instance %q: %w`, d.config.Instance, err)
+		return fmt.Errorf(`failed to create instance %q: %w`, name, err)
 	}
 
 	return nil
@@ -206,6 +228,7 @@ func (d *Driver) createSpannerDatabase(ctx context.Context) error {
 		return fmt.Errorf(`failed to create a database admin client: %w`, err)
 	}
 
+	log.Printf("Querying %q", d.dsn)
 	_, err = adminClient.GetDatabase(ctx, &databasepb.GetDatabaseRequest{
 		Name: d.dsn,
 	})
@@ -215,7 +238,7 @@ func (d *Driver) createSpannerDatabase(ctx context.Context) error {
 		// if the database exists, we just use it
 		return nil
 	case err != nil && spanner.ErrCode(err) != codes.NotFound:
-		return fmt.Errorf(`unexpected error while retrieving database: %w`, err)
+		return fmt.Errorf(`unexpected error while retrieving database %q: %w`, d.dsn, err)
 	default:
 		// no op, go to next
 	}
