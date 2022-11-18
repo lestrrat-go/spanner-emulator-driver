@@ -78,7 +78,7 @@ func (d *Driver) Run(ctx context.Context, options ...Option) <-chan error {
 	d.mu.Unlock()
 
 	dropDatabaseFn := func() error {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
 		adminClient, err := database.NewDatabaseAdminClient(ctx)
 		if err != nil {
@@ -153,7 +153,9 @@ func (d *Driver) Run(ctx context.Context, options ...Option) <-chan error {
 
 func (d *Driver) Close() {
 	for _, fn := range d.onClose {
-		fn()
+		if err := fn(); err != nil {
+			log.Printf("onClose callback failed: %s", err)
+		}
 	}
 }
 
