@@ -2,6 +2,7 @@ package driver_test
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -22,7 +23,12 @@ func TestDriver(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	exited := d.Run(ctx)
+	var options []driver.Option
+	if v := os.Getenv(`SPANNER_EMULATOR_DRIVER_TEST_INSTANCE_CONFIG`); v != "" {
+		options = append(options, driver.WithInstanceConfig(v))
+	}
+
+	exited := d.Run(ctx, options...)
 
 	require.NoError(t, d.Ready(ctx), `driver should start successfully`)
 

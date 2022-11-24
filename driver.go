@@ -29,13 +29,14 @@ const (
 // The zero value should not be used. Always use the value
 // returned from driver.New
 type Driver struct {
-	mu         *sync.RWMutex
-	cond       *sync.Cond
-	dsn        string
-	config     *Config
-	ready      bool
-	setupError error
-	onClose    []func() error
+	mu             *sync.RWMutex
+	cond           *sync.Cond
+	dsn            string
+	config         *Config
+	ready          bool
+	setupError     error
+	onClose        []func() error
+	instanceConfig string
 }
 
 func New(dsn string) (*Driver, error) {
@@ -59,6 +60,7 @@ func New(dsn string) (*Driver, error) {
 func (d *Driver) Run(ctx context.Context, options ...Option) <-chan error {
 	dropDatabase := true
 	useEmulator := true
+	instanceConfig := ""
 	for _, option := range options {
 		switch option.Ident() {
 		case identDropDatabase{}:
@@ -67,8 +69,12 @@ func (d *Driver) Run(ctx context.Context, options ...Option) <-chan error {
 			ctx = context.WithValue(ctx, identDDLDirectory{}, option.Value().(string))
 		case identUseEmulator{}:
 			useEmulator = option.Value().(bool)
+		case identInstanceConfig{}:
+			instanceConfig = option.Value().(string)
 		}
 	}
+
+	d.instanceConfig = instanceConfig
 
 	defer d.cond.Broadcast()
 
@@ -214,9 +220,19 @@ func (d *Driver) createSpannerInstance(ctx context.Context) error {
 		return fmt.Errorf(`unexpected error while retrieving instance: %w`, err)
 	}
 
+	if d.instanceConfig == "" {
+		return fmt.Errorf(`value for InstanceConfig must be specified via driver.WithInstanceCnfig() to create an instance`)
+	}
+
 	if _, err := instanceAdminClient.CreateInstance(ctx, &instancepb.CreateInstanceRequest{
 		Parent:     projectMarker + d.config.Project,
 		InstanceId: d.config.Instance,
+		Instance: &instancepb.Instance{
+			Name:        projectMarker + d.config.Project + instanceMarker + d.config.Instance,
+			Config:      d.instanceConfig,
+			DisplayName: d.config.Instance,
+			NodeCount:   1,
+		},
 	}); err != nil {
 		return fmt.Errorf(`failed to create instance %q: %w`, name, err)
 	}
