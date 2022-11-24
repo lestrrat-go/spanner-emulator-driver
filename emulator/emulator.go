@@ -47,6 +47,11 @@ func Run(ctx context.Context, options ...Option) error {
 	defer cancel()
 
 	name := fmt.Sprintf("spanner-emulator-%d-%d", grpcSrcPort, restSrcPort)
+
+	if _, err := exec.LookPath("docker"); err != nil {
+		return fmt.Errorf("could not find docker executable: %w", err)
+	}
+
 	cmd := exec.CommandContext(childCtx, "docker", "run", "-i", "--rm", "-p", grpcPortPublishSpec, "-p", restPortPublishSpec, "--name", name, DockerImage)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
